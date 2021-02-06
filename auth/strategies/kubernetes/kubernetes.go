@@ -35,7 +35,8 @@ func (k *kubeReview) authenticate(ctx context.Context, r *http.Request, token st
 		},
 	}
 
-	err := k.requester.Do(ctx, data, review, status)
+	//nolint:bodyclose
+	_, err := k.requester.Do(ctx, data, review, status)
 
 	switch {
 	case err != nil:

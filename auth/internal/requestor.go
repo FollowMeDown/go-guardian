@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"strings"
@@ -18,7 +19,9 @@ import (
 type Requester struct {
 	Addr     string
 	Endpoint string
-	Client   *http.Client
+	// Keep Unmarshalling body for all given types, by default stop after the first match
+	KeepUnmarshalling bool
+	Client            *http.Client
 	// AdditionalData add more data to http request
 	AdditionalData func(r *http.Request)
 	Unmarshal      func(data []byte, v interface{}) error
@@ -26,18 +29,30 @@ type Requester struct {
 }
 
 // Do sends the HTTP request and parse the HTTP response.
-func (r *Requester) Do(ctx context.Context, data, review, status interface{}) error {
-	body, err := r.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("Failed to marshal request body data, Type: %T, Err: %w", data, err)
-	}
+func (r *Requester) Do(ctx context.Context, data, review, status interface{}) (*http.Response, error) {
+	f := func(*http.Request) {}
+	return r.do(ctx, f, data, review, status)
+}
 
+// DoWithf same as Do but it accepts f to add additional  information to the request.
+func (r *Requester) DoWithf(ctx context.Context, f func(*http.Request), data, review, status interface{}) (*http.Response, error) { //nolint:lll
+	return r.do(ctx, f, data, review, status)
+}
+
+func (r *Requester) do(ctx context.Context, f func(r *http.Request), data, review, status interface{}) (*http.Response, error) { //nolint:lll
 	url := r.Addr + r.Endpoint
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(body))
+	reader, err := r.reader(data)
 	if err != nil {
-		return fmt.Errorf("Failed to create new HTTP request, Method: POST, URL: %s, Err: %w", url, err)
+		return nil, err
 	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, reader)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to create new HTTP request, Method: POST, URL: %s, Err: %w", url, err)
+	}
+
+	f(req)
 
 	if r.AdditionalData != nil {
 		r.AdditionalData(req)
@@ -45,25 +60,42 @@ func (r *Requester) Do(ctx context.Context, data, review, status interface{}) er
 
 	resp, err := r.Client.Do(req)
 	if err != nil {
-		return fmt.Errorf("Failed to send the HTTP request, Method: POST, URL: %s, Err: %w", url, err)
+		return nil, fmt.Errorf("Failed to send the HTTP request, Method: POST, URL: %s, Err: %w", url, err)
 	}
 
-	body, err = ioutil.ReadAll(resp.Body)
+	if resp.Body == http.NoBody {
+		return resp, nil
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("Failed to read the HTTP response, Method: POST, URL: %s, Err: %w", url, err)
+		return nil, fmt.Errorf("Failed to read the HTTP response, Method: POST, URL: %s, Err: %w", url, err)
 	}
 
 	defer resp.Body.Close()
 
-	if err := r.Unmarshal(body, status); err == nil {
-		return nil
+	if err := r.Unmarshal(body, status); err == nil && !r.KeepUnmarshalling {
+		return resp, nil
 	}
 
 	if err := r.Unmarshal(body, review); err != nil {
-		return fmt.Errorf("Failed to unmarshal response body data, Type: %T Err: %w", review, err)
+		return nil, fmt.Errorf("Failed to unmarshal response body data, Type: %T Err: %w", review, err)
 	}
 
-	return nil
+	return resp, nil
+}
+
+func (r *Requester) reader(data interface{}) (io.Reader, error) {
+	if data == nil {
+		return http.NoBody, nil
+	}
+
+	body, err := r.Marshal(data)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to marshal request body data, Type: %T, Err: %w", data, err)
+	}
+
+	return bytes.NewBuffer(body), nil
 }
 
 // SetRequesterBearerToken sets ruqester token.
@@ -73,6 +105,21 @@ func SetRequesterBearerToken(token string) auth.Option {
 			additionalData := r.AdditionalData
 			r.AdditionalData = func(r *http.Request) {
 				r.Header.Set("Authorization", "Bearer "+token)
+				if additionalData != nil {
+					additionalData(r)
+				}
+			}
+		}
+	})
+}
+
+// SetRequesterBasicAuth sets ruqester basic auth.
+func SetRequesterBasicAuth(username, password string) auth.Option {
+	return auth.OptionFunc(func(v interface{}) {
+		if r, ok := v.(*Requester); ok {
+			additionalData := r.AdditionalData
+			r.AdditionalData = func(r *http.Request) {
+				r.SetBasicAuth(username, password)
 				if additionalData != nil {
 					additionalData(r)
 				}
